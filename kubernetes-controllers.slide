@@ -1,0 +1,266 @@
+Writing Kubernetes controllers
+(using Go!)
+16 Feb 2017
+Tags: Go, Kubernetes
+
+Eric Chiang
+Engineer, CoreOS
+eric.chiang@coreos.com
+@erchiang
+
+* Kubernetes
+
+.image https://raw.githubusercontent.com/kubernetes/kubernetes/v1.5.3/logo/logo.png _ 500
+
+* Kubernetes
+
+Orchestration platform for running {apps, jobs} in containers.
+
+"Run 10 replicas of this app over 100 machines."
+
+Inspired by Google's Borg.
+
+One of the biggest open source Go projects.
+
+* The Kubernetes API
+
+What we'll be talking about today.
+
+Specifically: how to build clients that leverage this API.
+
+* Kubernetes: the guts
+
+.image img/kubernetes-architecture.png
+
+* The Kubernetes API
+
+Describes the configuration state.
+
+Resources like "nodes", "pods" (containerized app), "services" (load balancers), "deployments" (replicated set of pods).
+
+Basic verbs on each resource {get, list, create, update, delete, watch}.
+
+    $ curl http://localhost:8080/api/v1/nodes
+    {
+        Items: [
+            {
+                Kind: "node",
+                // ...
+            }
+        ]
+    }
+
+No transactions. No multi-resource requests.
+
+* "Controller"?
+
+Fancy Kubernetes-ism for a client that talks to the API in a loop.
+
+    for {
+        // Talk to API.
+    }
+
+Common theme of Kubernetes clients.
+
+- Take current state.
+- Bring it closer to desired state.
+- Repeat.
+
+* Controller examples
+
+Scheduler (grossly oversimplified):
+
+    for {
+        // List all nodes.
+
+        // List all pods.
+
+        // Loop through pods.
+        for _, pod := range pods.Items {
+            if pod.NodeName != "" {
+                // Pod already assigned to node.
+                continue
+            }
+
+            // Schedule pod.
+            pod.NodeName = schedulePod(nodes, pod)
+
+            // Record update.
+            if _, err := client.UpdatePod(pod); err != nil {
+                logger.Printf("failed to update pod: %v", err)
+            }
+        }
+    }
+
+* Controller examples
+
+- Replica-set controller: Loop that ensures the correct number of replicas are running.
+- kube-dns: Loop that looks for load balancer IPs (services) then creates in-cluster DNS records.
+
+* External examples
+
+.link https://github.com/coreos/etcd-operator
+
+Dynamic management of etcd clusters running on top of Kubernetes.
+
+.link https://github.com/jetstack/kube-lego
+
+Manipulates Kubernetes infrastructure to perform Let's Encrypt challenges.
+
+.link https://github.com/kelseyhightower/vault-controller
+
+Controller that talks to Vault. Does a handshake with containers that request secrets.
+
+* Controllers are...
+
+- a way to customize Kubernetes.
+- useful for prototyping new features.
+- effective ways of building mindshare (the Kubernetes community is _huge_).
+
+* Let's write a controller
+
+* First we need a client
+
+.link https://github.com/kubernetes/client-go k8s.io/client-go
+
+Not stable right now (being worked on).
+
+.link https://github.com/ericchiang/k8s
+
+What we'll be using today.
+
+Slimmed down for smaller use cases (2 dependencies) but still close to feature complete.
+
+Hopefully becomes redundant as client-go stabilizes.
+
+* Let's write a controller!
+
+Problem statement:
+
+"Deployments" are the API object which describe a set of apps.
+
+    apiVersion: extensions/v1beta1
+    kind: Deployment
+    metadata:
+      name: nginx-deployment
+    spec:
+      # When updating, how long the update has before it's marked as a failure.
+      progressDeadlineSeconds: 60
+
+      replicas: 3 # Run three replicas of this container somewhere in the cluster
+      template:
+        metadata:
+          labels:
+            app: nginx
+        spec:
+          containers:
+          - name: nginx
+            image: nginx:1.7.9 # Run a nginx image at version 1.7.9.
+            ports:
+            - containerPort: 80 # Expose port 80
+
+* Let's write a controller!
+
+Problem statement:
+
+"Deployments" are the API object which describe a set of apps.
+
+    apiVersion: extensions/v1beta1
+    kind: Deployment
+      # ...
+      # ...
+    spec:
+      # When updating, how long the update has before it's marked as a failure.
+      progressDeadlineSeconds: 60
+
+      replicas: 3 # Run three replicas of this container somewhere in the cluster
+      template:
+          # ...
+
+* Let's write a controller!
+
+Problem statement:
+
+Deployment is managed by Kubernetes.
+
+As of v1.5, can be marked as failed but won't roll back automatically.
+
+Let's write an "auto rollback" controller.
+
+.link https://github.com/ericchiang/kube-rollback-controller
+
+* Let's write a controller!
+
+    import (
+        // ...
+        "github.com/ericchiang/k8s"
+    )
+
+    type rollbackController struct { client *k8s.Client }
+
+    func main() {
+        // Containers are mounted with API credentials.
+        client, err := k8s.NewInClusterClient() 
+        if err != nil {
+            log.Fatal(err)
+        }
+
+        // Loop looking for deployments to roll back.
+        c := &rollbackController{client: client}
+        for {
+            if err := c.rollbackFailedDeployments(context.Background()); err != nil {
+                log.Printf("error: %v", err)
+            }
+            time.Sleep(5 * time.Second)
+        }
+    }
+
+* Let's write a controller!
+
+    func (c *rollbackController) rollbackFailedDeployments(ctx context.Context) error {
+        deployments, err := c.client.ExtensionsV1Beta1().ListDeployments(ctx, c.client.Namespace)
+        if err != nil {
+            return fmt.Errorf("list deployments: %v", err)
+        }
+
+        for _, d := range deployments.Items {
+            if !deploymentFailed(d) || d.Spec.RollbackTo != nil {
+                continue
+            }
+
+            // Request a rollback by updating the deployment.
+            var lastRevision int64 = 0
+            d.Spec.RollbackTo = &v1beta1.RollbackConfig{
+                Revision: &lastRevision,
+            }
+            if _, err := c.client.ExtensionsV1Beta1().Update(ctx, d); err != nil {
+                return fmt.Errorf("update deployment: %v", err)
+            }
+            log.Printf("rolled back deployment: %v", *d.Metadata.Name)
+        }
+        return nil
+    }
+
+* Demo
+
+* Conclusion
+
+Kubernetes is a big project...
+
+\... but you can customize it and do powerful things with very little code.
+
+* Conclusion
+
+What will you build?
+
+- CI systems that respond to events by launching containers?
+- Secret managers that rotate credentials on the cluster?
+- Operators that codify how to run complex software?
+
+* Conclusion 
+
+Build some controllers and show them off at CoreOS Fest!
+
+.link https://coreos.com/fest/
+
+May 31st - June 1st
